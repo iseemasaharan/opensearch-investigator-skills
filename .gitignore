@@ -1,0 +1,32 @@
+# Credentials and local config (see instaclustr.env.template)
+instaclustr.env
+solution/.ids.env
+.env
+.env.*
+!.env.example
+!instaclustr.env.template
+
+# Keys and certificates
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+id_rsa.*
+id_ed25519.*
+
+# Local runtime IDs from setup scripts
+opensearch_demo_ids.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node
+node_modules/
+
+# OS / editor
+.DS_Store

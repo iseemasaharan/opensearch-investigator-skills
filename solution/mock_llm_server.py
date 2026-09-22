@@ -1,0 +1,242 @@
+"""
+Mock OpenAI-compatible LLM server.
+Runs inside Docker (mock-llm container) on port 8765.
+OpenSearch connects to it via the connector at http://mock-llm:8765.
+
+Handles:
+  GET  /health                  - healthcheck
+  POST /v1/chat/completions     - synthesis requests from the investigation agent
+  POST /trigger-investigation   - webhook called by the Alerting monitor when
+                                  anomaly grade > 0.7; auto-triggers the agent
+                                  and logs the report (prod always-on hook)
+"""
+
+import json
+import os
+import re
+import threading
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib import request as urllib_request
+
+OPENSEARCH_BASE = os.environ.get("OPENSEARCH_URL", "http://localhost:9200").rstrip("/")
+AGENT_ID_FILE   = "/tmp/agent_id"          # written by setup_realtime.sh via env
+
+def _extract_section(text, keyword):
+    """Pull the first JSON-looking block or value after a keyword."""
+    idx = text.lower().find(keyword.lower())
+    if idx == -1:
+        return ""
+    return text[idx : idx + 400]
+
+
+def synthesize(prompt: str) -> str:
+    """Rule-based synthesis that reads tool outputs embedded in the prompt."""
+
+    # --- anomaly details (JSON or key=value format) ---
+    anomaly_score = "0.91"
+    for pat in [r'"anomaly_grade"\s*:\s*([\d.]+)', r'anomaly_grade=([\d.]+)']:
+        m = re.search(pat, prompt)
+        if m:
+            anomaly_score = m.group(1)
+            break
+
+    detector_name = "prod-latency-p99"
+    for pat in [r'"detector_name"\s*:\s*"([^"]+)"', r'detector[:\s=]+([a-z0-9_-]+latency[a-z0-9_-]*)']:
+        m = re.search(pat, prompt)
+        if m:
+            detector_name = m.group(1)
+            break
+
+    # --- deploy evidence (JSON or key=value) ---
+    deploy_version = None
+    for pat in [r'"version_to"\s*:\s*"([^"]+)"', r'version_to=([^\s,]+)']:
+        m = re.search(pat, prompt)
+        if m:
+            deploy_version = m.group(1)
+            break
+
+    deployer = "unknown"
+    for pat in [r'"deployed_by"\s*:\s*"([^"]+)"', r'deployed_by=([^\s,]+)']:
+        m = re.search(pat, prompt)
+        if m:
+            deployer = m.group(1)
+            break
+
+    deploy_service = "payment-service"
+    for pat in [r'"service"\s*:\s*"(payment[^"]+)"', r'service=(payment[^\s,]+)']:
+        m = re.search(pat, prompt)
+        if m:
+            deploy_service = m.group(1)
+            break
+
+    # --- error counts ---
+    npe_count = len(re.findall(r'NullPointerException', prompt, re.IGNORECASE))
+    timeout_count = len(re.findall(r'connection.*timeout|timeout.*connection|pool.*exhaust', prompt, re.IGNORECASE))
+    error_500_count = len(re.findall(r'http_status[=:]\s*5\d\d', prompt))
+
+    # --- latency evidence (key=value or JSON) ---
+    p99_values = re.findall(r'p99_latency(?:_ms)?[=:]\s*(\d+)', prompt)
+    max_p99 = max((int(v) for v in p99_values), default=0)
+    baseline_p99 = 120
+
+    confidence = 0.91 if deploy_version else 0.62
+
+    root_cause = (
+        f"Deploy of **{deploy_service} {deploy_version}** by `{deployer}` "
+        f"introduced a regression affecting p99 latency and error rate."
+        if deploy_version
+        else "No recent deploy found. Possible infrastructure or upstream dependency issue."
+    )
+
+    evidence_lines = []
+    if max_p99 > 0:
+        ratio = round(max_p99 / baseline_p99, 1)
+        evidence_lines.append(
+            f"- P99 latency peaked at **{max_p99} ms** ({ratio}× baseline of {baseline_p99} ms)"
+        )
+    if npe_count:
+        evidence_lines.append(
+            f"- **{npe_count}** NullPointerException(s) in {deploy_service} logs (zero baseline)"
+        )
+    if timeout_count:
+        evidence_lines.append(
+            f"- **{timeout_count}** DB connection timeout(s) — pool likely exhausted"
+        )
+    if error_500_count:
+        evidence_lines.append(f"- **{error_500_count}** HTTP 5xx responses in anomaly window")
+    if deploy_version:
+        evidence_lines.append(
+            f"- Deploy of {deploy_service} {deploy_version} by {deployer} occurred in anomaly window"
+        )
+
+    evidence_block = "\n".join(evidence_lines) if evidence_lines else "- Insufficient data for high-confidence analysis"
+
+    recommended_action = (
+        f"1. **Rollback** {deploy_service} to previous version immediately\n"
+        f"2. Inspect new code path introduced in {deploy_version} for null-safety issues\n"
+        f"3. Review DB connection pool configuration changes in the deploy"
+        if deploy_version
+        else "1. Check upstream service health\n2. Review infrastructure events\n3. Escalate to on-call lead"
+    )
+
+    return f"""## 🔍 Incident Investigation Report
+
+**Detector:** `{detector_name}`
+**Anomaly Score:** {anomaly_score} (threshold: 0.7)
+**Confidence:** {confidence:.0%}
+
+---
+
+### Root Cause Assessment
+
+{root_cause}
+
+### Evidence
+
+{evidence_block}
+
+### Recommended Action
+
+{recommended_action}
+
+---
+*Generated by OpenSearch investigation agent. Human review required before production changes.*"""
+
+
+def _run_investigation(alert_body: dict):
+    """
+    Called asynchronously when the Alerting monitor webhook fires.
+    Reads the current AGENT_ID from env/file, executes the investigation
+    agent, and logs the report. In production you'd also post to Slack /
+    PagerDuty here.
+    """
+    import os
+    agent_id = os.environ.get("AGENT_ID", "")
+    if not agent_id and os.path.exists(AGENT_ID_FILE):
+        agent_id = open(AGENT_ID_FILE).read().strip()
+    if not agent_id:
+        print("[webhook] AGENT_ID not set — skipping agent execution")
+        return
+
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S UTC")
+    grade = alert_body.get("anomaly_grade", "?")
+    print(f"\n[webhook] {ts} — anomaly grade={grade} — running investigation agent {agent_id}")
+
+    payload = json.dumps({"parameters": {"question": "investigate prod-latency-p99 alert"}}).encode()
+    req = urllib_request.Request(
+        f"{OPENSEARCH_BASE}/_plugins/_ml/agents/{agent_id}/_execute",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(req, timeout=30) as resp:
+            result = json.loads(resp.read())
+        outputs = result.get("inference_results", [{}])[0].get("output", [])
+        for out in outputs:
+            dam = out.get("dataAsMap", {})
+            content = ""
+            try:
+                content = dam["choices"][0]["message"]["content"]
+            except (KeyError, IndexError, TypeError):
+                content = out.get("result", str(dam))[:500]
+            print(f"[investigation] {content[:800]}")
+    except Exception as e:
+        print(f"[webhook] agent call failed: {e}")
+
+
+class MockLLMHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self._respond(200, {"status": "ok"})
+        else:
+            self._respond(404, {"error": "not found"})
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        body = json.loads(self.rfile.read(length) or b"{}")
+
+        # ── Alerting monitor webhook ──────────────────────────────────────────
+        if self.path == "/trigger-investigation":
+            self._respond(200, {"status": "received"})
+            threading.Thread(target=_run_investigation, args=(body,), daemon=True).start()
+            return
+
+        # Extract prompt from OpenAI chat format
+        prompt = ""
+        for msg in body.get("messages", []):
+            prompt += msg.get("content", "") + "\n"
+        if not prompt:
+            prompt = str(body)
+
+        report = synthesize(prompt)
+
+        self._respond(200, {
+            "id": "mock-inv-001",
+            "object": "chat.completion",
+            "model": "investigation-model",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": report},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": len(prompt) // 4, "completion_tokens": len(report) // 4},
+        })
+
+    def _respond(self, code: int, payload: dict):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        print(f"[mock-llm] {fmt % args}")
+
+
+if __name__ == "__main__":
+    server = HTTPServer(("0.0.0.0", 8765), MockLLMHandler)
+    print("[mock-llm] Listening on :8765")
+    server.serve_forever()

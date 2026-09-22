@@ -1,0 +1,97 @@
+services:
+  opensearch-node1:
+    image: opensearchproject/opensearch:3.0.0
+    container_name: opensearch-node1
+    environment:
+      - cluster.name=opensearch-skills-cluster
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - OPENSEARCH_JAVA_OPTS=-Xms1g -Xmx1g
+      - DISABLE_SECURITY_PLUGIN=true
+      - plugins.ml_commons.only_run_on_ml_node=false
+      - plugins.ml_commons.native_memory_threshold=99
+      - plugins.ml_commons.memory_feature_enabled=true
+    volumes:
+      - opensearch-data1:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+      - "9600:9600"
+    networks:
+      - opensearch-net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qv '\"status\":\"red\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
+
+  seed-data:
+    image: python:3.11-slim
+    container_name: seed-data
+    command: ["sh", "-c", "pip install opensearch-py requests -q --trusted-host pypi.org --trusted-host files.pythonhosted.org && python /app/seed_data.py"]
+    volumes:
+      - ./solution:/app
+    environment:
+      - OPENSEARCH_URL=http://opensearch-node1:9200
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+    restart: "no"
+
+  log-generator:
+    image: python:3.11-slim
+    container_name: log-generator
+    command: ["sh", "-c", "pip install opensearch-py requests -q --trusted-host pypi.org --trusted-host files.pythonhosted.org && python /app/log_generator.py"]
+    volumes:
+      - ./solution:/app
+    environment:
+      - OPENSEARCH_URL=http://opensearch-node1:9200
+      - TICK_SECONDS=30
+      - INITIAL_DELAY_S=120
+      - INCIDENT_DURATION_S=300
+      - INCIDENT_INTERVAL_S=1200
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+    restart: unless-stopped
+
+  investigation-ui:
+    image: python:3.11-slim
+    container_name: investigation-ui
+    command: ["sh", "-c", "pip install streamlit opensearch-py requests pandas plotly boto3 -q --trusted-host pypi.org --trusted-host files.pythonhosted.org && streamlit run /app/investigation_ui.py --server.port 8501 --server.address 0.0.0.0 --server.headless true"]
+    volumes:
+      - ./solution:/app
+    environment:
+      - OPENSEARCH_URL=http://opensearch-node1:9200
+    ports:
+      - "8501:8501"
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+
+  opensearch-dashboards:
+    image: opensearchproject/opensearch-dashboards:3.0.0
+    container_name: opensearch-dashboards
+    ports:
+      - "5601:5601"
+    environment:
+      - OPENSEARCH_HOSTS=["http://opensearch-node1:9200"]
+      - DISABLE_SECURITY_DASHBOARDS_PLUGIN=true
+    networks:
+      - opensearch-net
+    depends_on:
+      opensearch-node1:
+        condition: service_healthy
+
+volumes:
+  opensearch-data1:
+
+networks:
+  opensearch-net:
+    driver: bridge

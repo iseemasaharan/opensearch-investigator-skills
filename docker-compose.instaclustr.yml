@@ -1,0 +1,57 @@
+# docker-compose override for Instaclustr managed OpenSearch.
+# Replaces local opensearch-node1 with a no-op stub so depends_on
+# references resolve cleanly. All app services connect to the
+# Instaclustr cluster via OPENSEARCH_URL.
+#
+# Usage:
+#   source instaclustr.env
+#   docker compose -f docker-compose.yml -f docker-compose.instaclustr.yml up -d
+
+services:
+  # Replace local OpenSearch with a stub that exits immediately as healthy.
+  # This satisfies depends_on references without running a real cluster.
+  opensearch-node1:
+    image: busybox
+    container_name: opensearch-node1
+    command: sh -c "sleep infinity"
+    healthcheck:
+      test: ["CMD", "true"]
+      interval: 5s
+      timeout: 2s
+      retries: 1
+      start_period: 1s
+    ports: []
+    volumes: []
+    environment: []
+
+  # Disable local Dashboards — use Instaclustr's built-in Dashboards URL
+  opensearch-dashboards:
+    image: busybox
+    container_name: opensearch-dashboards
+    command: sh -c "exit 0"
+    ports: []
+    environment: []
+
+  seed-data:
+    env_file: instaclustr.env
+    environment:
+      - OPENSEARCH_URL=${OPENSEARCH_URL}
+
+  log-generator:
+    env_file: instaclustr.env
+    environment:
+      - OPENSEARCH_URL=${OPENSEARCH_URL}
+      - TICK_SECONDS=30
+      - INITIAL_DELAY_S=60
+      - INCIDENT_DURATION_S=300
+      - INCIDENT_INTERVAL_S=600
+    command: ["sh", "-c", "pip install opensearch-py requests -q --trusted-host pypi.org --trusted-host files.pythonhosted.org && sleep 5 && python /app/log_generator.py"]
+
+  investigation-ui:
+    env_file: instaclustr.env
+    environment:
+      - OPENSEARCH_URL=${OPENSEARCH_URL}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      - BEDROCK_MODEL_ID=${BEDROCK_MODEL_ID:-us.anthropic.claude-sonnet-4-6}
